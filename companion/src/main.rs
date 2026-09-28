@@ -12,6 +12,10 @@ use icue_edge_companion::{http, media, spotify, util};
 
 const APP_NAME: &str = "iCUE Edge Companion";
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// Where Task Manager keeps the enabled/disabled switch of each Run entry (first byte: 02 on, 03 off).
+/// Some Task Manager builds list only entries that have a value here.
+const APPROVED_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+const APPROVED_ON: &str = "020000000000000000000000";
 const MAIN: &str = "main";
 const TRAY: &str = "tray";
 const TRAY_SIZE: (f64, f64) = (340.0, 540.0);
@@ -180,14 +184,17 @@ async fn set_paused(app: AppHandle, paused: bool) {
 
 #[tauri::command]
 async fn set_autostart(enabled: bool) -> bool {
-    let mut cmd = std::process::Command::new(util::system_exe("reg.exe"));
-    if enabled {
+    let reg = |args: &[&str]| hidden(std::process::Command::new(util::system_exe("reg.exe")).args(args)).output().is_ok_and(|o| o.status.success());
+    let ok = if enabled {
         let Ok(exe) = std::env::current_exe() else { return false };
-        cmd.args(["add", RUN_KEY, "/v", APP_NAME, "/t", "REG_SZ", "/d", &format!("\"{}\"", exe.display()), "/f"]);
+        // The approved value also re-enables an entry switched off in Task Manager.
+        reg(&["add", RUN_KEY, "/v", APP_NAME, "/t", "REG_SZ", "/d", &format!("\"{}\"", exe.display()), "/f"])
+            && reg(&["add", APPROVED_KEY, "/v", APP_NAME, "/t", "REG_BINARY", "/d", APPROVED_ON, "/f"])
     } else {
-        cmd.args(["delete", RUN_KEY, "/v", APP_NAME, "/f"]);
-    }
-    hidden(&mut cmd).output().is_ok_and(|o| o.status.success()) && autostart_enabled() == enabled
+        let _ = reg(&["delete", APPROVED_KEY, "/v", APP_NAME, "/f"]);
+        reg(&["delete", RUN_KEY, "/v", APP_NAME, "/f"])
+    };
+    ok && autostart_enabled() == enabled
 }
 
 /// Clears hourly history and events. Offsets, dedup keys and Codex per-session
@@ -256,8 +263,25 @@ async fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
+/// On when the Run entry exists and Task Manager has not switched it off.
 fn autostart_enabled() -> bool {
-    hidden(&mut std::process::Command::new(util::system_exe("reg.exe"))).args(["query", RUN_KEY, "/v", APP_NAME]).output().is_ok_and(|o| o.status.success())
+    let query = |key: &str| hidden(std::process::Command::new(util::system_exe("reg.exe")).args(["query", key, "/v", APP_NAME])).output().ok().filter(|o| o.status.success());
+    query(RUN_KEY).is_some() && !query(APPROVED_KEY).is_some_and(|o| approved_off(&String::from_utf8_lossy(&o.stdout)))
+}
+
+/// `reg query` line `    iCUE Edge Companion    REG_BINARY    0300…`: an odd first byte means disabled.
+fn approved_off(out: &str) -> bool {
+    out.split_whitespace().skip_while(|w| *w != "REG_BINARY").nth(1).and_then(|hex| u8::from_str_radix(hex.get(..2)?, 16).ok()).is_some_and(|b| b & 1 == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn task_manager_switch_is_read() {
+        assert!(super::approved_off("\r\nHKEY_CURRENT_USER\\...\\Run\r\n    iCUE Edge Companion    REG_BINARY    030000000000000000000000\r\n"));
+        assert!(!super::approved_off("    iCUE Edge Companion    REG_BINARY    020000000000000000000000"));
+        assert!(!super::approved_off(""));
+    }
 }
 
 // ---------- tray icon ----------
