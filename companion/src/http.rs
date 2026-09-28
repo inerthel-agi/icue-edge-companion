@@ -351,6 +351,20 @@ fn handle(mut stream: TcpStream, shared: Shared) {
             }
             None => respond(&mut stream, 404, &headers, b"{\"error\":\"no_artwork\"}"),
         },
+        ("GET", "/api/spotify/queue-art") => {
+            let art = match (req.param("i").and_then(|i| i.parse().ok()), req.param("q").and_then(|q| q.parse().ok())) {
+                (Some(i), Some(q)) => spotify::queue_art_for(&spotify::lock(), i, q),
+                _ => None,
+            };
+            match art {
+                Some((mime, bytes)) => {
+                    headers.retain(|(k, _)| *k != "Content-Type");
+                    headers.push(("Content-Type", mime.into()));
+                    respond(&mut stream, 200, &headers, &bytes);
+                }
+                None => respond(&mut stream, 404, &headers, b"{\"error\":\"no_artwork\"}"),
+            }
+        }
         ("POST", "/api/spotify/command") => {
             let call = req.json().ok_or((400, "bad_request")).and_then(|body| spotify::resolve(&spotify::lock(), &body));
             match call.and_then(|c| spotify::api::execute(&c)) {

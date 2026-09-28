@@ -1,11 +1,12 @@
 //! Spotify Web API polling, artwork, LRCLIB lyrics and command execution.
 //! Polls /me/player every 1 s while playing, 3 s when paused, 8 s with nothing playing,
 //! and waits on Retry-After when Spotify rate-limits.
-use super::{auth, lock, parse_lrc, publish, publish_if, Allowed, Art, Call, Device, Item, Line, Lyrics, Player, Status, HUB};
+use super::{auth, lock, parse_lrc, publish, publish_if, Allowed, Art, Call, Device, Item, Line, Lyrics, Player, Status, Upcoming, HUB, QUEUE_LEN};
 use crate::util::{now_ms, read_limited, SEC};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
@@ -250,6 +251,73 @@ fn fetch_lyrics(rev: u64, item: Item) {
     }
 }
 
+// ---------- queue (up next) ----------
+
+/// The next tracks from a /me/player/queue answer, with the ~300 px cover (enough for a row thumbnail).
+fn upcoming_from(v: &Value) -> Vec<Upcoming> {
+    let names = |a: &Value| a.as_array().map(|x| x.iter().filter_map(|n| n["name"].as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let list = v["queue"].as_array().map(Vec::as_slice).unwrap_or_default();
+    list.iter()
+        .take(QUEUE_LEN)
+        .map(|it| {
+            let episode = it["type"].as_str() == Some("episode");
+            let images = if episode { &it["images"] } else { &it["album"]["images"] };
+            // Spotify lists images largest first: take the smallest one still at least 160 px wide.
+            let imgs = images.as_array().map(Vec::as_slice).unwrap_or_default();
+            let art = imgs.iter().rev().find(|i| i["width"].as_u64().unwrap_or(0) >= 160).or(imgs.first());
+            Upcoming {
+                title: it["name"].as_str().unwrap_or("").to_string(),
+                artists: if episode { it["show"]["name"].as_str().unwrap_or("").to_string() } else { names(&it["artists"]) },
+                art_url: art.and_then(|i| i["url"].as_str()).map(String::from),
+            }
+        })
+        .collect()
+}
+
+static QUEUE_GEN: AtomicU64 = AtomicU64::new(0);
+static QUEUE_AT: AtomicU64 = AtomicU64::new(0);
+const QUEUE_EVERY_MS: u64 = 30 * SEC;
+const MAX_THUMB_BYTES: u64 = 1024 * 1024;
+
+fn fetch_queue() {
+    let gen = QUEUE_GEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let Ok(v) = call_api("GET", "/me/player/queue", None) else { return };
+    let queue = v.as_ref().map(upcoming_from).unwrap_or_default();
+    // Covers already downloaded for the same URL are kept; only new ones are fetched.
+    let known: Vec<(Option<String>, Option<(&'static str, Arc<Vec<u8>>)>)> = {
+        let st = lock();
+        st.queue.iter().map(|q| q.art_url.clone()).zip(st.queue_art.iter().cloned()).collect()
+    };
+    let art = queue
+        .iter()
+        .map(|q| {
+            let url = q.art_url.as_ref()?;
+            if let Some((_, a)) = known.iter().find(|(u, a)| u.as_ref() == Some(url) && a.is_some()) {
+                return a.clone();
+            }
+            if !art_host_ok(url) {
+                return None;
+            }
+            let mut buf = Vec::new();
+            direct_get(url).ok()?.into_reader().take(MAX_THUMB_BYTES + 1).read_to_end(&mut buf).ok()?;
+            (buf.len() as u64 <= MAX_THUMB_BYTES).then_some(())?;
+            crate::media::sniff(&buf).map(|mime| (mime, Arc::new(buf)))
+        })
+        .collect::<Vec<_>>();
+    let mut st = lock();
+    // A newer fetch started meanwhile: its answer wins.
+    if QUEUE_GEN.load(Ordering::SeqCst) != gen {
+        return;
+    }
+    let changed = st.queue != queue || st.queue_art.iter().map(Option::is_some).ne(art.iter().map(Option::is_some));
+    if changed {
+        st.queue = queue;
+        st.queue_art = art;
+        st.queue_rev += 1;
+        publish(&mut st);
+    }
+}
+
 // ---------- polling ----------
 
 fn fetch_profile() {
@@ -327,6 +395,12 @@ fn poll_once(last_devices: &mut u64) -> Duration {
                 };
                 (spawn, Duration::from_secs(wait))
             };
+            // Up next: at every track change, and every 30 s while playing (the user may edit the queue).
+            let playing = player.as_ref().is_some_and(|p| p.playing);
+            if spawn.is_some() || (playing && now >= QUEUE_AT.load(Ordering::Relaxed) + QUEUE_EVERY_MS) {
+                QUEUE_AT.store(now, Ordering::Relaxed);
+                std::thread::spawn(fetch_queue);
+            }
             if let Some((rev, item)) = spawn {
                 if let Some(url) = item.art_url.clone() {
                     std::thread::spawn(move || fetch_art(rev, url));
@@ -371,7 +445,17 @@ pub fn run() {
 
 /// Runs a validated widget command, then asks the poller for a fresh reading.
 pub fn execute(call: &Call) -> Result<(), (u16, &'static str)> {
-    let result = call_api(call.method, &call.path, call.body.as_deref());
+    let mut result = Ok(None);
+    for n in 0..call.times.max(1) {
+        if n > 0 {
+            // Spotify applies skips in order only when they are not fired at the same instant.
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        result = call_api(call.method, &call.path, call.body.as_deref());
+        if result.is_err() {
+            break;
+        }
+    }
     let mut st = lock();
     st.poke = true;
     HUB.changed.notify_all();
@@ -445,6 +529,18 @@ mod tests {
             Some(Lyrics::Ready(l)) => assert_eq!(l[0].text, "Hi"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn queue_parsing_keeps_five_with_mid_size_covers() {
+        let track = |n: u32| json!({ "type": "track", "name": format!("T{n}"), "artists": [{ "name": "A" }, { "name": "B" }],
+            "album": { "images": [{ "url": "https://i.scdn.co/640", "width": 640 }, { "url": "https://i.scdn.co/300", "width": 300 }, { "url": "https://i.scdn.co/64", "width": 64 }] } });
+        let episode = json!({ "type": "episode", "name": "E", "show": { "name": "Show" }, "images": [{ "url": "https://i.scdn.co/e", "width": 640 }] });
+        let q = upcoming_from(&json!({ "queue": [track(1), episode, track(3), track(4), track(5), track(6)] }));
+        assert_eq!(q.len(), QUEUE_LEN);
+        assert_eq!((q[0].title.as_str(), q[0].artists.as_str(), q[0].art_url.as_deref()), ("T1", "A, B", Some("https://i.scdn.co/300")));
+        assert_eq!((q[1].artists.as_str(), q[1].art_url.as_deref()), ("Show", Some("https://i.scdn.co/e")));
+        assert!(upcoming_from(&json!({})).is_empty());
     }
 
     #[test]

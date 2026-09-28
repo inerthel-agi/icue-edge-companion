@@ -100,6 +100,17 @@ pub struct Art {
     pub bytes: Arc<Vec<u8>>,
 }
 
+/// One upcoming track from /me/player/queue, with its small cover once downloaded.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Upcoming {
+    pub title: String,
+    pub artists: String,
+    pub art_url: Option<String>,
+}
+
+/// Upcoming tracks shown by the widget.
+pub const QUEUE_LEN: usize = 5;
+
 #[derive(Default)]
 pub struct State {
     pub version: u64,
@@ -114,6 +125,10 @@ pub struct State {
     pub art: Option<Art>,
     pub art_pending: bool,
     pub lyrics: Lyrics,
+    pub queue: Vec<Upcoming>,
+    /// Bumped whenever `queue` changes; cover URLs carry it so a widget never shows a stale cover.
+    pub queue_rev: u64,
+    pub queue_art: Vec<Option<(&'static str, Arc<Vec<u8>>)>>,
     pub last_seen: u64,
     pub rate_limited_until: Option<u64>,
     pub pending: Option<auth::Pending>,
@@ -215,7 +230,17 @@ pub fn snapshot(st: &State) -> Value {
         },
         "rateLimitedUntil": st.rate_limited_until.filter(|&t| t > now_ms()),
         "lyrics": lyrics,
+        "queueRev": st.queue_rev,
+        "queue": st.queue.iter().enumerate().map(|(i, q)| json!({
+            "title": q.title,
+            "artist": q.artists,
+            "art": st.queue_art.get(i).and_then(Option::as_ref).map(|_| json!({ "url": format!("/api/spotify/queue-art?i={i}&q={}", st.queue_rev) })),
+        })).collect::<Vec<_>>(),
     })
+}
+
+pub fn queue_art_for(st: &State, index: usize, queue_rev: u64) -> Option<(&'static str, Arc<Vec<u8>>)> {
+    (queue_rev == st.queue_rev).then(|| st.queue_art.get(index)?.as_ref().map(|(m, b)| (*m, Arc::clone(b)))).flatten()
 }
 
 /// What the companion window shows. Only the last 4 characters of the client id leave the store.
@@ -248,6 +273,8 @@ pub struct Call {
     pub method: &'static str,
     pub path: String,
     pub body: Option<String>,
+    /// How many times to send it: `skipTo` is that many "next" in a row (Spotify has no jump-to-queue-item).
+    pub times: u8,
 }
 
 /// Validates a widget command against the state. Errors are (HTTP status, code).
@@ -271,7 +298,7 @@ pub fn resolve(st: &State, body: &Value) -> Result<Call, (u16, &'static str)> {
         }
         Ok(())
     };
-    let call = |method: &'static str, path: String| Call { method, path, body: None };
+    let call = |method: &'static str, path: String| Call { method, path, body: None, times: 1 };
     Ok(match cmd {
         "playPause" => {
             if !a.play_pause {
@@ -282,6 +309,15 @@ pub fn resolve(st: &State, body: &Value) -> Result<Call, (u16, &'static str)> {
         "next" => {
             current(a.next)?;
             call("POST", "/me/player/next".into())
+        }
+        // Tap on an up-next row: skip forward to it. The list the widget saw must still be current.
+        "skipTo" => {
+            current(a.next)?;
+            if body["q"].as_u64() != Some(st.queue_rev) {
+                return Err((409, "queue_changed"));
+            }
+            let i = body["value"].as_u64().filter(|&i| (i as usize) < st.queue.len()).ok_or((400, "bad_request"))?;
+            Call { times: i as u8 + 1, ..call("POST", "/me/player/next".into()) }
         }
         "prev" => {
             current(a.prev)?;
@@ -318,7 +354,7 @@ pub fn resolve(st: &State, body: &Value) -> Result<Call, (u16, &'static str)> {
             let id = body["deviceId"].as_str().ok_or((400, "bad_request"))?;
             // Only a device Spotify listed for this account; the id never reaches a URL.
             let d = st.devices.iter().find(|d| d.id == id).ok_or((404, "device_gone"))?;
-            Call { method: "PUT", path: "/me/player".into(), body: Some(json!({ "device_ids": [d.id], "play": true }).to_string()) }
+            Call { method: "PUT", path: "/me/player".into(), body: Some(json!({ "device_ids": [d.id], "play": true }).to_string()), times: 1 }
         }
         _ => return Err((400, "unknown_command")),
     })
@@ -375,6 +411,14 @@ mod tests {
         assert_eq!(r(json!({ "cmd": "transfer", "deviceId": "../../me" })).unwrap_err(), (404, "device_gone"));
         assert_eq!(r(json!({ "cmd": "transfer", "deviceId": "d1" })).unwrap().body.unwrap(), r#"{"device_ids":["d1"],"play":true}"#);
         assert_eq!(r(json!({ "cmd": "delete" })).unwrap_err(), (400, "unknown_command"));
+        let mut q = connected();
+        q.queue = vec![Upcoming { title: "A".into(), artists: "X".into(), art_url: None }, Upcoming { title: "B".into(), artists: "Y".into(), art_url: None }];
+        q.queue_rev = 4;
+        let skip = |v: Value| resolve(&q, &v);
+        assert_eq!(skip(json!({ "cmd": "skipTo", "rev": 7, "q": 4, "value": 1 })).unwrap().times, 2);
+        assert_eq!(skip(json!({ "cmd": "skipTo", "rev": 7, "q": 3, "value": 1 })).unwrap_err(), (409, "queue_changed"));
+        assert_eq!(skip(json!({ "cmd": "skipTo", "rev": 7, "q": 4, "value": 2 })).unwrap_err(), (400, "bad_request"));
+        assert_eq!(skip(json!({ "cmd": "skipTo", "rev": 6, "q": 4, "value": 0 })).unwrap_err(), (409, "track_changed"));
         let mut off = connected();
         off.status = Status::NeedsLogin;
         assert_eq!(resolve(&off, &json!({ "cmd": "playPause" })).unwrap_err(), (409, "not_connected"));
