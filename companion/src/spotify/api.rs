@@ -144,6 +144,7 @@ fn player_from(v: &Value, now: u64) -> Player {
         progress_ms: v["progress_ms"].as_u64().unwrap_or(0),
         updated_at: now,
         shuffle: v["shuffle_state"].as_bool().unwrap_or(false),
+        smart_shuffle: v["smart_shuffle"].as_bool().unwrap_or(false),
         repeat: v["repeat_state"].as_str().unwrap_or("off").to_string(),
         device: v.get("device").filter(|d| d.is_object()).map(device_from),
         allowed: Allowed {
@@ -161,7 +162,7 @@ fn player_from(v: &Value, now: u64) -> Player {
 fn differs(old: &Player, new: &Player) -> bool {
     let predicted = old.progress_ms + if old.playing { new.updated_at.saturating_sub(old.updated_at) } else { 0 };
     let drift = predicted.abs_diff(new.progress_ms);
-    old.item != new.item || old.playing != new.playing || old.shuffle != new.shuffle || old.repeat != new.repeat
+    old.item != new.item || old.playing != new.playing || old.shuffle != new.shuffle || old.smart_shuffle != new.smart_shuffle || old.repeat != new.repeat
         || old.device != new.device || old.allowed != new.allowed || drift > DRIFT_MS
 }
 
@@ -360,7 +361,7 @@ fn poll_once(last_devices: &mut u64) -> Duration {
             let player = v.as_ref().map(|v| player_from(v, now));
             let (spawn, wait, reshuffled) = {
                 let mut st = lock();
-                let reshuffled = matches!((&st.player, &player), (Some(a), Some(b)) if a.shuffle != b.shuffle);
+                let reshuffled = matches!((&st.player, &player), (Some(a), Some(b)) if (a.shuffle, a.smart_shuffle) != (b.shuffle, b.smart_shuffle));
                 if st.status == Status::Connecting {
                     st.status = Status::Connected;
                 }
@@ -396,7 +397,7 @@ fn poll_once(last_devices: &mut u64) -> Duration {
                 };
                 (spawn, Duration::from_secs(wait), reshuffled)
             };
-            // Up next: at every track change or shuffle toggle, and every 30 s while playing (the user may edit the queue).
+            // Up next: at every track change or shuffle / Smart Shuffle toggle, and every 30 s while playing (the user may edit the queue).
             let playing = player.as_ref().is_some_and(|p| p.playing);
             if spawn.is_some() || reshuffled || (playing && now >= QUEUE_AT.load(Ordering::Relaxed) + QUEUE_EVERY_MS) {
                 // Spotify reorders the queue a moment after a shuffle toggle: read it again 2 s later.
@@ -483,7 +484,7 @@ mod tests {
     #[test]
     fn player_parsing_and_disallows() {
         let v = json!({
-            "is_playing": true, "progress_ms": 5000, "shuffle_state": true, "repeat_state": "context",
+            "is_playing": true, "progress_ms": 5000, "shuffle_state": true, "smart_shuffle": true, "repeat_state": "context",
             "currently_playing_type": "track",
             "device": { "id": "d1", "name": "Desktop", "type": "Computer", "is_active": true, "volume_percent": 65, "supports_volume": true },
             "actions": { "disallows": { "skipping_prev": true, "toggling_shuffle": true } },
@@ -497,6 +498,7 @@ mod tests {
         assert_eq!(it.art_url.as_deref(), Some("https://i.scdn.co/image/abc"));
         assert!(p.allowed.next && !p.allowed.prev && !p.allowed.shuffle && p.allowed.repeat && p.allowed.play_pause);
         assert_eq!(p.device.as_ref().unwrap().volume, Some(65));
+        assert!(p.shuffle && p.smart_shuffle && differs(&Player { smart_shuffle: false, ..p.clone() }, &p));
         let ad = player_from(&json!({ "currently_playing_type": "ad", "is_playing": true, "item": null }), 0);
         assert_eq!(ad.item.unwrap().title, "Advertisement");
         let fixed = device_from(&json!({ "id": "p", "supports_volume": false, "volume_percent": 30 }));

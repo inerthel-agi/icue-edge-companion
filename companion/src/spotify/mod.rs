@@ -74,6 +74,8 @@ pub struct Player {
     pub progress_ms: u64,
     pub updated_at: u64,
     pub shuffle: bool,
+    /// Smart Shuffle keeps `shuffle_state` true, so it is tracked on its own to refresh Up next.
+    pub smart_shuffle: bool,
     pub repeat: String,
     pub device: Option<Device>,
     pub allowed: Allowed,
