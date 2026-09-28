@@ -41,6 +41,13 @@ Window pages:
 | `Widgets` | Each of our widgets on the XENEON EDGE and the pump LCD: installed, placed, connected. Read-only scan of iCUE's files (`CUE5\html_widgets`, `CUE5\dashlcd\storage` for the XENEON EDGE layout, `CUE5\profiles\*.cueprofiledata` for pump screens) plus the live streams per feed; installation steps. |
 | `Settings` | Theme (`OLED`, default, true black; `Dark`; `Light`; remembered, also applied to the tray card), start with Windows (off by default, `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `iCUE Edge Companion`), pause collection, refresh limits, clear usage history. |
 
+Window with demo usage figures (the track is real):
+
+| | |
+| --- | --- |
+| <img src="docs/screenshots/overview.png" width="400" alt="Overview page" /><br>`Overview` | <img src="docs/screenshots/claude.png" width="400" alt="Claude page" /><br>`Claude` |
+| <img src="docs/screenshots/widgets.png" width="400" alt="Widgets page" /><br>`Widgets` | <img src="docs/screenshots/settings.png" width="400" alt="Settings page" /><br>`Settings` |
+
 Claude limits are shown as the share used, with a 24 h chart of the headline limit (10-minute steps, gaps left empty) and an estimate of when it reaches 100% at the last hour's pace. Codex limits are shown as the share left, like the Codex app.
 
 iCUE widgets `Claude Usage` and `Codex Usage` (source folders `icue-edge-widgets/widgets/xeneon-edge/claude-usage` and `icue-edge-widgets/widgets/xeneon-edge/codex-usage`):
