@@ -358,8 +358,9 @@ fn poll_once(last_devices: &mut u64) -> Duration {
         }
         Ok(v) => {
             let player = v.as_ref().map(|v| player_from(v, now));
-            let (spawn, wait) = {
+            let (spawn, wait, reshuffled) = {
                 let mut st = lock();
+                let reshuffled = matches!((&st.player, &player), (Some(a), Some(b)) if a.shuffle != b.shuffle);
                 if st.status == Status::Connecting {
                     st.status = Status::Connected;
                 }
@@ -393,12 +394,13 @@ fn poll_once(last_devices: &mut u64) -> Duration {
                     Some(_) => 3,
                     None => 8,
                 };
-                (spawn, Duration::from_secs(wait))
+                (spawn, Duration::from_secs(wait), reshuffled)
             };
-            // Up next: at every track change, and every 30 s while playing (the user may edit the queue).
+            // Up next: at every track change or shuffle toggle, and every 30 s while playing (the user may edit the queue).
             let playing = player.as_ref().is_some_and(|p| p.playing);
-            if spawn.is_some() || (playing && now >= QUEUE_AT.load(Ordering::Relaxed) + QUEUE_EVERY_MS) {
-                QUEUE_AT.store(now, Ordering::Relaxed);
+            if spawn.is_some() || reshuffled || (playing && now >= QUEUE_AT.load(Ordering::Relaxed) + QUEUE_EVERY_MS) {
+                // Spotify reorders the queue a moment after a shuffle toggle: read it again 2 s later.
+                QUEUE_AT.store(if reshuffled { now + 2 * SEC - QUEUE_EVERY_MS } else { now }, Ordering::Relaxed);
                 std::thread::spawn(fetch_queue);
             }
             if let Some((rev, item)) = spawn {
