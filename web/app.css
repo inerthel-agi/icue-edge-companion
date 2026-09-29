@@ -118,3 +118,43 @@
 .np-text small { color: var(--faint); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .np-prog { display: grid; gap: 6px; }
 .np-times { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* ---------- Motion (all of it stops with "reduce motion") ---------- */
+.side { position: relative; }
+.nav { position: relative; z-index: 1; transition: color .18s, transform .12s; }
+.nav:active { transform: scale(.98); }
+/* One indicator slides between the entries instead of each entry lighting up on its own. */
+.nav[aria-current="page"] { background: transparent; }
+.nav-ind { position: absolute; z-index: 0; left: 10px; right: 10px; top: 0; height: 0; border-radius: 8px; background: var(--hover); opacity: 0; pointer-events: none;
+  transition: transform .3s cubic-bezier(.2, .7, .2, 1), height .3s cubic-bezier(.2, .7, .2, 1), opacity .2s; }
+.nav-ind.ready { opacity: 1; }
+.nav-ind.instant { transition: none; }
+
+.card { transition: border-color .2s, transform .25s cubic-bezier(.2, .7, .2, 1); }
+.card:hover { border-color: var(--line-2); transform: translateY(-2px); }
+.link { transition: opacity .15s; }
+.link:hover { opacity: .8; }
+
+/* Live status: a slow ring, so a running collection looks alive. */
+.dot { transition: background-color .3s; }
+.dot.live, .status:not(.warn)::before { animation: live-ring 2.6s ease-out infinite; }
+@keyframes live-ring { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--live) 50%, transparent); } 70%, 100% { box-shadow: 0 0 0 7px transparent; } }
+.status::before { transition: background-color .3s; }
+
+#refresh:disabled svg { animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+details.help[open] dl { animation: fade-slide .28s ease; }
+@keyframes fade-slide { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+
+.waiting { animation: fade-slide .4s ease; }
+.winbtns button { transition: background-color .15s, color .15s; }
+
+/* Switching the theme fades the colours instead of flipping them. */
+html.theme-fade, html.theme-fade * { transition: background-color .35s, color .35s, border-color .35s, fill .35s, stroke .35s !important; }
+
+@media (prefers-reduced-motion: reduce) {
+  .dot.live, .status::before, #refresh:disabled svg, details.help[open] dl, .waiting { animation: none; }
+  .card:hover { transform: none; }
+  .nav-ind { transition: none; }
+}

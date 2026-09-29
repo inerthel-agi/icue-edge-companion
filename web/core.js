@@ -295,8 +295,17 @@
     }
 
     // CSP forbids inline style attributes: bar widths are applied through the CSSOM after rendering.
-    function applyWidths(root) {
-        root.querySelectorAll("[data-w]").forEach((el) => { el.style.width = Math.max(0, Math.min(100, Number(el.dataset.w))) + "%"; });
+    // `from` (the widths the same bars had before this render, empty on a new page) makes the bars grow from
+    // there; without it the widths are set at once, as the tray card and the widgets expect.
+    function applyWidths(root, from) {
+        const bars = [...root.querySelectorAll("[data-w]")];
+        const target = (el) => Math.max(0, Math.min(100, Number(el.dataset.w)));
+        const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+        const animate = Array.isArray(from) && !still && (from.length === 0 || from.length === bars.length);
+        bars.forEach((el, i) => { el.style.width = (animate ? Math.min(100, from[i] || 0) : target(el)) + "%"; });
+        if (!animate) return;
+        void root.offsetWidth;
+        requestAnimationFrame(() => bars.forEach((el) => { el.style.width = target(el) + "%"; }));
     }
 
     window.Usage = {

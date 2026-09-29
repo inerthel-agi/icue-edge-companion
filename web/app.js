@@ -9,6 +9,9 @@
   let helpOpen = false;
   let sp = null;
   let spClientId = "";
+  let renderedPage = null;
+  let enterPending = true;
+  const still = window.matchMedia("(prefers-reduced-motion: reduce)");
 
   const ICON_ALERT = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>';
   const pill = (p) => '<span class="pill ' + (p.state === "idle" ? "" : p.state) + '">' + esc(p.stateText) + "</span>" + (p.refreshing ? ' <span class="pill busy">Updating</span>' : "");
@@ -291,13 +294,60 @@
     if (html !== lastHtml) {
       const focused = document.activeElement && content.contains(document.activeElement) ? document.activeElement.dataset.act || document.activeElement.dataset.go : null;
       const focusedTheme = focused === "theme" ? document.activeElement.dataset.theme : null;
+      // On the same page the bars grow from their old widths; on a new page they grow from zero.
+      const from = renderedPage === page ? [...content.querySelectorAll("[data-w]")].map((e) => Number(e.dataset.w)) : [];
       content.innerHTML = html;
       lastHtml = html;
-      U.applyWidths(content);
+      renderedPage = page;
+      U.applyWidths(content, from);
+      // A page slides in once, when its real content first shows (not for the "Loading…" placeholder).
+      if (enterPending && !html.includes('class="waiting"')) { enterPending = false; enterPage(); }
       if (focused) { const el = content.querySelector(focusedTheme ? '[data-theme="' + focusedTheme + '"]' : '[data-act="' + focused + '"],[data-go="' + focused + '"]'); if (el) el.focus(); }
     }
     chrome(v);
   }
+
+  // ---------- motion ----------
+  // Web Animations on the blocks already in place: a later re-render (a clock tick, a new reading)
+  // makes new nodes that are not animated, so nothing replays on its own.
+  function countUp(el) {
+    const m = /^(\d+)(.*)$/.exec(el.textContent.trim());
+    if (!m || Number(m[1]) === 0) return;
+    const end = Number(m[1]), rest = m[2], t0 = performance.now(), ms = 800;
+    const step = (t) => {
+      const k = Math.min(1, (t - t0) / ms);
+      el.textContent = Math.round(end * (1 - Math.pow(1 - k, 3))) + rest;
+      if (k < 1) requestAnimationFrame(step);
+    };
+    el.textContent = "0" + rest;
+    requestAnimationFrame(step);
+  }
+
+  function enterPage() {
+    if (still.matches) return;
+    const root = content.querySelector(".page") || content;
+    const blocks = [];
+    for (const el of root.children) { if (el.classList.contains("cards")) blocks.push(...el.children); else blocks.push(el); }
+    blocks.forEach((el, i) => el.animate(
+      [{ opacity: 0, transform: "translateY(12px)" }, { opacity: 1, transform: "none" }],
+      { duration: 420, delay: Math.min(i, 8) * 55, easing: "cubic-bezier(.2,.7,.2,1)", fill: "backwards" }));
+    content.querySelectorAll(".spark").forEach((el) => el.animate(
+      [{ clipPath: "inset(0 100% 0 0)" }, { clipPath: "inset(0 0 0 0)" }],
+      { duration: 1000, delay: 250, easing: "cubic-bezier(.3,.6,.2,1)", fill: "backwards" }));
+    content.querySelectorAll(".hero-figure b, .limit-right b").forEach((el) => { if (/^\d+%/.test(el.textContent.trim())) countUp(el); });
+  }
+
+  function moveNav(instant) {
+    const ind = document.getElementById("navInd");
+    const cur = document.querySelector('.nav[aria-current="page"]');
+    if (!ind || !cur) return;
+    ind.classList.toggle("instant", !!instant);
+    ind.style.height = cur.offsetHeight + "px";
+    ind.style.transform = "translateY(" + cur.offsetTop + "px)";
+    ind.classList.add("ready");
+    if (instant) requestAnimationFrame(() => ind.classList.remove("instant"));
+  }
+  window.addEventListener("resize", () => moveNav(true));
 
   function chrome(v) {
     const side = document.getElementById("side-status");
@@ -330,6 +380,8 @@
     page = next;
     document.querySelectorAll(".nav").forEach((n) => n.setAttribute("aria-current", n.dataset.page === page ? "page" : "false"));
     lastHtml = "";
+    enterPending = true;
+    moveNav(false);
     render();
     content.scrollTop = 0;
     if (page === "widgets" || page === "settings") loadInfo();
@@ -362,7 +414,14 @@
     const act = e.target.closest("[data-act]");
     if (!act) return;
     switch (act.dataset.act) {
-      case "theme": window.setTheme(act.dataset.theme); lastHtml = ""; return render();
+      case "theme": {
+        const root = document.documentElement;
+        root.classList.add("theme-fade");
+        setTimeout(() => root.classList.remove("theme-fade"), 450);
+        window.setTheme(act.dataset.theme);
+        lastHtml = "";
+        return render();
+      }
       case "autostart":
         await U.invoke("set_autostart", { enabled: act.getAttribute("aria-checked") !== "true" });
         return loadInfo();
@@ -411,6 +470,7 @@
 
   document.querySelectorAll("[data-logo]").forEach((el) => { el.innerHTML = U.LOGO[el.dataset.logo]; });
   U.start(render);
+  moveNav(true);
   loadInfo();
   loadSpotify();
   // Connected widget count and autostart can change outside this window.
