@@ -11,6 +11,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 mod gsmtc;
 #[cfg(windows)]
 mod volume;
+pub mod viz;
 pub mod relay;
 
 /// A thumbnail identical to the previous track's may simply not be updated yet by the player.

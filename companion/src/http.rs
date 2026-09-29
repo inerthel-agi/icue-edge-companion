@@ -307,6 +307,7 @@ fn handle(mut stream: TcpStream, shared: Shared) {
                 media::snapshot(&st).to_string()
             })
         }),
+        ("GET", "/api/media/viz") => stream_events(stream, &req, Feed::Media, media::viz::next),
         ("GET", "/api/media/art") => {
             let art = match (req.param("s"), req.param("r").and_then(|r| r.parse().ok())) {
                 (Some(id), Some(rev)) => media::art_for(&media::lock(), id, rev),
