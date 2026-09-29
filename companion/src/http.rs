@@ -321,6 +321,12 @@ fn handle(mut stream: TcpStream, shared: Shared) {
                 None => respond(&mut stream, 404, &headers, b"{\"error\":\"no_artwork\"}"),
             }
         }
+        ("POST", "/api/media/command") if matches!(req.json().as_ref().and_then(|b| b["cmd"].as_str()), Some("volume" | "mute" | "sleep")) => {
+            match media::system_command(&req.json().unwrap_or_default(), now_ms()) {
+                Ok(()) => respond(&mut stream, 200, &headers, b"{\"ok\":true}"),
+                Err((code, error)) => respond(&mut stream, code, &headers, format!("{{\"error\":\"{error}\"}}").as_bytes()),
+            }
+        }
         ("POST", "/api/media/command") => {
             let target = req.json().ok_or((400, "bad_request")).and_then(|body| media::resolve(&media::lock(), &body, now_ms()));
             match target.map(|t| media::execute(&t)) {

@@ -9,6 +9,8 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
 #[cfg(windows)]
 mod gsmtc;
+#[cfg(windows)]
+mod volume;
 pub mod relay;
 
 /// A thumbnail identical to the previous track's may simply not be updated yet by the player.
@@ -46,6 +48,15 @@ pub struct Caps {
     pub next: bool,
     pub prev: bool,
     pub seek: bool,
+    pub shuffle: bool,
+    pub repeat: bool,
+}
+
+/// Shuffle and repeat as the player reports them (None: not reported). Repeat: 0 off, 1 track, 2 list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Modes {
+    pub shuffle: Option<bool>,
+    pub repeat: Option<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -78,6 +89,7 @@ pub struct Observed {
     pub playback: Playback,
     pub timeline: Option<Timeline>,
     pub caps: Caps,
+    pub modes: Modes,
     pub thumb: Thumb,
 }
 
@@ -99,6 +111,7 @@ pub struct Session {
     pub playback: Playback,
     pub timeline: Option<Timeline>,
     pub caps: Caps,
+    pub modes: Modes,
     pub art: Option<Art>,
     pub art_pending: bool,
     /// None until looked up; reset with every new revision of the track.
@@ -119,6 +132,10 @@ pub struct State {
     pub missing_name: Option<String>,
     pub last_seen: u64,
     pub error: Option<String>,
+    /// System output volume 0..=100 and mute, when Windows reports them.
+    pub volume: Option<(u8, bool)>,
+    /// When the sleep timer pauses playback (ms since epoch).
+    pub sleep_at: Option<u64>,
     published_at: u64,
     next_rev: u64,
 }
@@ -225,6 +242,7 @@ pub fn merge(st: &mut State, observed: Vec<Observed>, current_app: Option<String
             playback: Playback::Unknown,
             timeline: None,
             caps: Caps::default(),
+            modes: Modes::default(),
             art: None,
             art_pending: false,
             lyrics: None,
@@ -245,10 +263,11 @@ pub fn merge(st: &mut State, observed: Vec<Observed>, current_app: Option<String
             s.changed_at = now;
             changed = true;
         }
-        if s.playback != o.playback || s.timeline != o.timeline || s.caps != o.caps {
+        if s.playback != o.playback || s.timeline != o.timeline || s.caps != o.caps || s.modes != o.modes {
             s.playback = o.playback;
             s.timeline = o.timeline;
             s.caps = o.caps;
+            s.modes = o.modes;
             changed = true;
         }
         let settling = now < s.changed_at + ART_SETTLE_MS;
@@ -392,7 +411,8 @@ fn session_json(s: &Session) -> Value {
             "duration": t.duration_ms.map(|d| d as f64 / 1000.0),
             "updatedAt": t.updated_at,
         })),
-        "caps": { "playPause": s.caps.play_pause, "next": s.caps.next, "prev": s.caps.prev, "seek": s.caps.seek },
+        "caps": { "playPause": s.caps.play_pause, "next": s.caps.next, "prev": s.caps.prev, "seek": s.caps.seek, "shuffle": s.caps.shuffle, "repeat": s.caps.repeat },
+        "modes": { "shuffle": s.modes.shuffle, "repeat": s.modes.repeat },
         "art": s.art.as_ref().map(|a| json!({ "url": format!("/api/media/art?s={}&r={}", s.id, a.rev), "sessionId": s.id, "rev": a.rev })),
         "lyrics": s.lyrics.as_ref().map(crate::spotify::lyrics_json),
         "artState": if s.art.is_some() { "ready" } else if s.art_pending { "pending" } else { "none" },
@@ -416,7 +436,65 @@ pub fn snapshot(st: &State) -> Value {
             "id": s.id, "app": { "name": app_name(&s.app_id) }, "title": s.meta.title, "playback": s.playback.word(),
         })).collect::<Vec<_>>(),
         "session": shown.map(session_json),
+        "system": st.volume.map(|(level, muted)| json!({ "volume": level, "muted": muted, "sleepUntil": st.sleep_at })),
     })
+}
+
+/// Records the system volume read by the media thread; publishes when it changed.
+pub fn set_volume(volume: Option<(u8, bool)>, now: u64) {
+    let mut st = lock();
+    if st.volume != volume {
+        st.volume = volume;
+        st.publish(now);
+    }
+}
+
+/// The paused-playback target when the sleep timer is due (the timer is spent either way).
+pub fn due_sleep(now: u64) -> Option<Target> {
+    let mut st = lock();
+    if !st.sleep_at.is_some_and(|t| now >= t) {
+        return None;
+    }
+    st.sleep_at = None;
+    st.publish(now);
+    pick(&st)
+        .filter(|s| s.playback == Playback::Playing)
+        .map(|s| Target { app_id: s.app_id.clone(), ordinal: s.ordinal, action: Action::Toggle, start_ticks: s.timeline.map_or(0, |t| t.start_ticks) })
+}
+
+/// Commands that concern the computer, not one player: volume, mute, sleep timer.
+pub fn system_command(body: &Value, now: u64) -> Result<(), (u16, &'static str)> {
+    match body["cmd"].as_str() {
+        Some("volume") => {
+            let v = body["value"].as_f64().filter(|v| v.is_finite()).ok_or((400, "bad_request"))?;
+            set_system_volume(Some(v.round().clamp(0.0, 100.0) as u8), None, now)
+        }
+        Some("mute") => set_system_volume(None, Some(body["value"].as_bool().ok_or((400, "bad_request"))?), now),
+        Some("sleep") => {
+            // Minutes; 0 cancels. A day at most.
+            let m = body["value"].as_f64().filter(|v| v.is_finite() && *v >= 0.0).ok_or((400, "bad_request"))?.min(1440.0);
+            let mut st = lock();
+            st.sleep_at = (m > 0.0).then(|| now + (m * 60_000.0) as u64);
+            st.publish(now);
+            Ok(())
+        }
+        _ => Err((400, "unknown_command")),
+    }
+}
+
+fn set_system_volume(level: Option<u8>, muted: Option<bool>, now: u64) -> Result<(), (u16, &'static str)> {
+    #[cfg(windows)]
+    {
+        let done = level.map_or(Ok(()), volume::set_level).and(muted.map_or(Ok(()), volume::set_mute));
+        done.map_err(|_| (503, "audio_unavailable"))?;
+        set_volume(volume::read(), now);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (level, muted, now);
+        Err((503, "audio_unavailable"))
+    }
 }
 
 /// Artwork bytes, only for the revision they were read for.
@@ -430,6 +508,8 @@ pub enum Action {
     Next,
     Prev,
     SeekMs(u64),
+    Shuffle(bool),
+    Repeat(u8),
 }
 
 #[derive(Debug, PartialEq)]
@@ -458,13 +538,15 @@ pub fn resolve(st: &State, body: &Value, now: u64) -> Result<Target, (u16, &'sta
             let limit = s.timeline.and_then(|t| t.duration_ms).unwrap_or(ms);
             (Action::SeekMs(ms.min(limit)), s.caps.seek)
         }
+        "shuffle" => (Action::Shuffle(body["value"].as_bool().ok_or((400, "bad_request"))?), s.caps.shuffle),
+        "repeat" => (Action::Repeat(body["value"].as_u64().filter(|v| *v <= 2).ok_or((400, "bad_request"))? as u8), s.caps.repeat),
         _ => return Err((400, "unknown_command")),
     };
     if !allowed {
         return Err((422, "unsupported"));
     }
     // Skips and seeks aimed at a track that already changed are refused, never replayed on the new one.
-    if action != Action::Toggle && body["rev"].as_u64() != Some(s.rev) {
+    if !matches!(action, Action::Toggle | Action::Shuffle(_) | Action::Repeat(_)) && body["rev"].as_u64() != Some(s.rev) {
         return Err((409, "track_changed"));
     }
     Ok(Target { app_id: s.app_id.clone(), ordinal: s.ordinal, action, start_ticks: s.timeline.map_or(0, |t| t.start_ticks) })
@@ -529,7 +611,8 @@ mod tests {
             meta: Meta { title: title.into(), artist: "A".into(), album: album.into() },
             playback: Playback::Playing,
             timeline: None,
-            caps: Caps { play_pause: true, next: true, prev: true, seek: true },
+            caps: Caps { play_pause: true, next: true, prev: true, seek: true, ..Default::default() },
+            modes: Modes::default(),
             thumb,
         }
     }
@@ -593,6 +676,37 @@ mod tests {
         assert_eq!(resolve(&st, &cmd("playPause", rev - 1), 0).unwrap().action, Action::Toggle);
         assert_eq!(resolve(&st, &cmd("playPause", rev), STALE_MS + 1).unwrap_err(), (503, "stale"));
         assert_eq!(resolve(&st, &json!({ "cmd": "next", "sessionId": "m-gone", "rev": 1 }), 0).unwrap_err(), (404, "session_gone"));
+    }
+
+    #[test]
+    fn shuffle_and_repeat_need_support_and_a_valid_value() {
+        let mut st = State::new();
+        let mut o = obs("One", "", Thumb::Missing);
+        o.caps.shuffle = true;
+        merge(&mut st, vec![o], None, 0);
+        st.last_seen = 0;
+        let id = shown(&st).id.clone();
+        let cmd = |c: &str, v: Value| json!({ "cmd": c, "sessionId": id, "value": v });
+        // Modes are not tied to a track revision: no rev is sent and none is needed.
+        assert_eq!(resolve(&st, &cmd("shuffle", json!(true)), 0).unwrap().action, Action::Shuffle(true));
+        assert_eq!(resolve(&st, &cmd("shuffle", json!(1)), 0).unwrap_err(), (400, "bad_request"));
+        assert_eq!(resolve(&st, &cmd("repeat", json!(1)), 0).unwrap_err(), (422, "unsupported"));
+    }
+
+    #[test]
+    fn sleep_timer_pauses_what_plays_once() {
+        let mut st = State::new();
+        merge(&mut st, vec![obs("One", "", Thumb::Missing)], None, 0);
+        drop(st);
+        {
+            let mut g = lock();
+            *g = State::new();
+            merge(&mut g, vec![obs("One", "", Thumb::Missing)], None, 0);
+            g.sleep_at = Some(1_000);
+        }
+        assert!(due_sleep(999).is_none());
+        assert_eq!(due_sleep(1_000).map(|t| t.action), Some(Action::Toggle));
+        assert!(due_sleep(2_000).is_none());
     }
 
     #[test]

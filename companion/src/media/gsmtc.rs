@@ -1,6 +1,6 @@
 //! Windows media sessions (GlobalSystemMediaTransportControls), polled twice a second.
 //! ponytail: polling instead of the session change events; switch to events if 500 ms is too slow.
-use super::{apply, lock, set_error, wants_thumb, Action, Caps, Meta, Observed, Playback, Target, Thumb, Timeline, MAX_ART_BYTES};
+use super::{apply, lock, set_error, wants_thumb, Action, Caps, Meta, Modes, Observed, Playback, Target, Thumb, Timeline, MAX_ART_BYTES};
 use crate::util::now_ms;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionManager as Manager, GlobalSystemMediaTransportControlsSessionMediaProperties as Properties,
     GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status, GlobalSystemMediaTransportControlsSessionTimelineProperties as TimelineProperties,
 };
+use windows::Media::MediaPlaybackAutoRepeatMode;
 use windows::Storage::Streams::DataReader;
 
 const POLL: Duration = Duration::from_millis(500);
@@ -58,6 +59,11 @@ fn poll(manager: &Manager) -> Result<()> {
         }
     }
     apply(observed, current, now);
+    super::set_volume(super::volume::read(), now);
+    // The sleep timer pauses whatever is playing when it runs out.
+    if let Some(target) = super::due_sleep(now) {
+        let _ = execute(&target);
+    }
     Ok(())
 }
 
@@ -78,11 +84,17 @@ fn observe(session: &windows::Media::Control::GlobalSystemMediaTransportControls
         next: c.IsNextEnabled()?,
         prev: c.IsPreviousEnabled()?,
         seek: c.IsPlaybackPositionEnabled()?,
+        shuffle: c.IsShuffleEnabled()?,
+        repeat: c.IsRepeatEnabled()?,
+    };
+    let modes = Modes {
+        shuffle: info.IsShuffleActive().ok().and_then(|r| r.Value().ok()),
+        repeat: info.AutoRepeatMode().ok().and_then(|r| r.Value().ok()).map(|m| m.0 as u8),
     };
     let timeline = timeline(&session.GetTimelineProperties()?, now);
     let fetch = wants_thumb(&lock(), &app_id, ordinal, &meta, now);
     let thumb = if fetch { read_thumb(&props) } else { Thumb::Unchanged };
-    Ok(Observed { app_id, ordinal, meta, playback, timeline, caps, thumb })
+    Ok(Observed { app_id, ordinal, meta, playback, timeline, caps, modes, thumb })
 }
 
 fn timeline(t: &TimelineProperties, now: u64) -> Option<Timeline> {
@@ -138,6 +150,8 @@ pub fn execute(target: &Target) -> Result<bool> {
                 Action::Next => session.TrySkipNextAsync()?.get(),
                 Action::Prev => session.TrySkipPreviousAsync()?.get(),
                 Action::SeekMs(ms) => session.TryChangePlaybackPositionAsync(target.start_ticks + ms as i64 * 10_000)?.get(),
+                Action::Shuffle(on) => session.TryChangeShuffleActiveAsync(on)?.get(),
+                Action::Repeat(mode) => session.TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode(mode as i32))?.get(),
             };
         }
         n += 1;
