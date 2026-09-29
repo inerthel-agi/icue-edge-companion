@@ -253,13 +253,32 @@ fn lyrics_from(v: &Value) -> Option<Lyrics> {
 /// LRCLIB exact match first (title, artist, album, duration), then the closest synced search result.
 /// None when LRCLIB could not be reached: that answer is not cached, the next play asks again.
 fn find_lyrics(item: &Item) -> Option<Lyrics> {
-    let artist = item.artists.split(", ").next().unwrap_or("").to_string();
-    let secs = item.duration_ms / 1000;
-    let exact = lrclib("get", &[("track_name", item.title.clone()), ("artist_name", artist.clone()), ("album_name", item.album.clone()), ("duration", secs.to_string())]);
+    find_lyrics_by(&item.title, item.artists.split(", ").next().unwrap_or(""), &item.album, item.duration_ms / 1000)
+}
+
+/// Lyrics of a track played by any Windows player (Now Playing), cached by title, artist and length.
+/// Lyrics::None when LRCLIB has nothing or could not be reached (the latter is not cached).
+pub fn lyrics_for(title: &str, artist: &str, album: &str, secs: u64) -> Lyrics {
+    let key = format!("media|{title}|{artist}|{secs}");
+    if let Some(l) = LYRICS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return l.clone();
+    }
+    let Some(found) = find_lyrics_by(title, artist, album, secs) else { return Lyrics::None };
+    let mut cache = LYRICS_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, found.clone());
+    found
+}
+
+fn find_lyrics_by(title: &str, artist: &str, album: &str, secs: u64) -> Option<Lyrics> {
+    let (title, artist) = (title.to_string(), artist.to_string());
+    let exact = lrclib("get", &[("track_name", title.clone()), ("artist_name", artist.clone()), ("album_name", album.to_string()), ("duration", secs.to_string())]);
     if let Some(l) = exact.as_ref().and_then(lyrics_from) {
         return Some(l);
     }
-    let found = lrclib("search", &[("track_name", item.title.clone()), ("artist_name", artist)])?;
+    let found = lrclib("search", &[("track_name", title), ("artist_name", artist)])?;
     let best = found
         .as_array()
         .and_then(|a| {

@@ -209,12 +209,7 @@ pub fn snapshot(st: &State) -> Value {
     });
     let allowed = p.map(|p| p.allowed).unwrap_or_default();
     let device = p.and_then(|p| p.device.as_ref());
-    let lyrics = match &st.lyrics {
-        Lyrics::None => json!({ "state": "none" }),
-        Lyrics::Loading => json!({ "state": "loading" }),
-        Lyrics::Instrumental => json!({ "state": "instrumental" }),
-        Lyrics::Ready(lines) => json!({ "state": "ready", "lines": lines.iter().map(|l| json!({ "timeMs": l.time_ms, "text": l.text })).collect::<Vec<_>>() }),
-    };
+    let lyrics = lyrics_json(&st.lyrics);
     json!({
         "schema": "spotify/1",
         "source": { "kind": "companion", "connected": true, "lastSeen": st.last_seen },
@@ -361,6 +356,16 @@ pub fn resolve(st: &State, body: &Value) -> Result<Call, (u16, &'static str)> {
         }
         _ => return Err((400, "unknown_command")),
     })
+}
+
+/// Wire shape of lyrics, shared by the Spotify and the media snapshots.
+pub fn lyrics_json(l: &Lyrics) -> Value {
+    match l {
+        Lyrics::None => json!({ "state": "none" }),
+        Lyrics::Loading => json!({ "state": "loading" }),
+        Lyrics::Instrumental => json!({ "state": "instrumental" }),
+        Lyrics::Ready(lines) => json!({ "state": "ready", "lines": lines.iter().map(|l| json!({ "timeMs": l.time_ms, "text": l.text })).collect::<Vec<_>>() }),
+    }
 }
 
 /// Parses LRC text (`[mm:ss.xx] line`) into timed lines.

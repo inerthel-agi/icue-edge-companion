@@ -414,6 +414,7 @@ fn main() {
             }
             std::thread::Builder::new().name("media".into()).spawn(media::run)?;
             std::thread::Builder::new().name("media-relay".into()).spawn(media::relay::run)?;
+            std::thread::Builder::new().name("media-lyrics".into()).spawn(media::run_lyrics)?;
             std::thread::Builder::new().name("spotify".into()).spawn(spotify::api::run)?;
             let spotify_app = app.handle().clone();
             std::thread::spawn(move || forward_spotify(spotify_app));

@@ -3,6 +3,7 @@
 //! artwork and the commands shown together always share the same session id and `rev`, so an
 //! old cover or a command aimed at the previous track is never mixed with the new one.
 use crate::util::{now_ms, pseudonym, random_hex, SEC};
+use crate::spotify::Lyrics;
 use serde_json::{json, Value};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
@@ -100,6 +101,8 @@ pub struct Session {
     pub caps: Caps,
     pub art: Option<Art>,
     pub art_pending: bool,
+    /// None until looked up; reset with every new revision of the track.
+    pub lyrics: Option<Lyrics>,
     changed_at: u64,
     art_checked_at: u64,
     prev_art_hash: Option<u64>,
@@ -154,8 +157,11 @@ pub fn session_id(instance: &str, app_id: &str, ordinal: u32) -> String {
 
 /// Readable player name from its AppUserModelId ("Spotify.exe", "Brave.BM6…", "Microsoft.ZuneMusic_…!App").
 pub fn app_name(app_id: &str) -> String {
-    const KNOWN: [(&str, &str); 6] = [
+    const KNOWN: [(&str, &str); 8] = [
         ("308046B0AF4A39CB", "Firefox"),
+        // Firefox-based browsers publish a hash of their install path instead of a name.
+        ("F0DC299D809B9700", "Zen Browser"),
+        ("SpotifyAB", "Spotify"),
         ("ZuneMusic", "Media Player"),
         ("ZuneVideo", "Films & TV"),
         ("msedge", "Edge"),
@@ -221,6 +227,7 @@ pub fn merge(st: &mut State, observed: Vec<Observed>, current_app: Option<String
             caps: Caps::default(),
             art: None,
             art_pending: false,
+            lyrics: None,
             changed_at: now,
             art_checked_at: 0,
             prev_art_hash: None,
@@ -234,6 +241,7 @@ pub fn merge(st: &mut State, observed: Vec<Observed>, current_app: Option<String
             st.next_rev += 1;
             s.art = None;
             s.art_pending = true;
+            s.lyrics = None;
             s.changed_at = now;
             changed = true;
         }
@@ -321,6 +329,42 @@ pub fn set_error(message: String) {
     }
 }
 
+/// What to ask LRCLIB for a track, or None when a match would be a guess: the artist and a
+/// plausible length are needed (a browser tab titled after a video has neither).
+fn lyric_query(meta: &Meta, duration_ms: Option<u64>) -> Option<(String, String, u64)> {
+    let secs = duration_ms? / 1000;
+    let artist = meta.artist.trim().trim_end_matches(" - Topic").trim();
+    (!meta.title.trim().is_empty() && !artist.is_empty() && (30..=1200).contains(&secs)).then(|| (meta.title.trim().to_string(), artist.to_string(), secs))
+}
+
+/// Looks up synced lyrics (LRCLIB) for the session on screen, once per track revision.
+pub fn run_lyrics() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let job = {
+            let mut st = lock();
+            let target = pick(&st)
+                .filter(|s| s.lyrics.is_none())
+                .and_then(|s| lyric_query(&s.meta, s.timeline.and_then(|t| t.duration_ms)).map(|q| (s.id.clone(), s.rev, s.meta.album.clone(), q)));
+            if let Some((id, ..)) = &target {
+                if let Some(s) = st.sessions.iter_mut().find(|s| s.id == *id) {
+                    s.lyrics = Some(Lyrics::Loading);
+                }
+                st.publish(now_ms());
+            }
+            target
+        };
+        let Some((id, rev, album, (title, artist, secs))) = job else { continue };
+        let found = crate::spotify::api::lyrics_for(&title, &artist, &album, secs);
+        let mut st = lock();
+        // A newer revision of the track started meanwhile: this answer is for the old one.
+        if let Some(s) = st.sessions.iter_mut().find(|s| s.id == id && s.rev == rev) {
+            s.lyrics = Some(found);
+            st.publish(now_ms());
+        }
+    }
+}
+
 /// The session shown: the picked one, else a playing one (Windows' current first), else any.
 pub fn pick(st: &State) -> Option<&Session> {
     if let Some(id) = &st.manual {
@@ -350,6 +394,7 @@ fn session_json(s: &Session) -> Value {
         })),
         "caps": { "playPause": s.caps.play_pause, "next": s.caps.next, "prev": s.caps.prev, "seek": s.caps.seek },
         "art": s.art.as_ref().map(|a| json!({ "url": format!("/api/media/art?s={}&r={}", s.id, a.rev), "sessionId": s.id, "rev": a.rev })),
+        "lyrics": s.lyrics.as_ref().map(crate::spotify::lyrics_json),
         "artState": if s.art.is_some() { "ready" } else if s.art_pending { "pending" } else { "none" },
     })
 }
@@ -464,6 +509,16 @@ pub fn execute(target: &Target) -> Result<bool, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn lyric_query_needs_artist_and_plausible_length() {
+        let meta = |t: &str, a: &str| Meta { title: t.into(), artist: a.into(), album: String::new() };
+        assert_eq!(lyric_query(&meta("Song", "Band - Topic"), Some(215_400)), Some(("Song".into(), "Band".into(), 215)));
+        assert_eq!(lyric_query(&meta("Song", ""), Some(215_000)), None);
+        assert_eq!(lyric_query(&meta("Song", "Band"), None), None);
+        assert_eq!(lyric_query(&meta("Song", "Band"), Some(10_000)), None);
+        assert_eq!(lyric_query(&meta("Video", "Channel"), Some(3 * 3_600_000)), None);
+    }
+
     const PNG_A: &[u8] = &[0x89, b'P', b'N', b'G', 1];
     const PNG_B: &[u8] = &[0x89, b'P', b'N', b'G', 2];
 
@@ -574,6 +629,8 @@ mod tests {
         assert_eq!(app_name("Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic"), "Media Player");
         assert_eq!(app_name("308046B0AF4A39CB"), "Firefox");
         assert_eq!(app_name("chrome"), "Chrome");
+        assert_eq!(app_name("F0DC299D809B9700"), "Zen Browser");
+        assert_eq!(app_name("SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify"), "Spotify");
         assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
         assert_eq!(sniff(b"<svg"), None);
     }
