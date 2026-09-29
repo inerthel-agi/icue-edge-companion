@@ -437,6 +437,8 @@ pub fn snapshot(st: &State) -> Value {
             "id": s.id, "app": { "name": app_name(&s.app_id) }, "title": s.meta.title, "playback": s.playback.word(),
         })).collect::<Vec<_>>(),
         "session": shown.map(session_json),
+        // Spotify only: its queue comes from the Spotify API, which Windows media sessions do not expose.
+        "queue": shown.filter(|s| app_name(&s.app_id) == "Spotify").and_then(|s| crate::spotify::queue_for(&s.meta.title)),
         "system": st.volume.map(|(level, muted)| json!({ "volume": level, "muted": muted, "sleepUntil": st.sleep_at })),
     })
 }

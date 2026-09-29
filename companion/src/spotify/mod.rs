@@ -237,6 +237,25 @@ pub fn snapshot(st: &State) -> Value {
     })
 }
 
+/// The queue as the Now Playing widget shows it, only while `title` is the track Spotify reports as
+/// playing: the queue of another track must never sit under this one.
+pub fn queue_for(title: &str) -> Option<Value> {
+    let st = lock();
+    let playing = st.player.as_ref()?.item.as_ref()?;
+    let live = matches!(st.status, Status::Connected | Status::PremiumRequired);
+    if !live || st.queue.is_empty() || !playing.title.trim().eq_ignore_ascii_case(title.trim()) {
+        return None;
+    }
+    Some(json!({
+        "rev": st.queue_rev,
+        "items": st.queue.iter().enumerate().map(|(i, q)| json!({
+            "title": q.title,
+            "artist": q.artists,
+            "art": st.queue_art.get(i).and_then(Option::as_ref).map(|_| json!({ "url": format!("/api/spotify/queue-art?i={i}&q={}", st.queue_rev) })),
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 pub fn queue_art_for(st: &State, index: usize, queue_rev: u64) -> Option<(&'static str, Arc<Vec<u8>>)> {
     (queue_rev == st.queue_rev).then(|| st.queue_art.get(index)?.as_ref().map(|(m, b)| (*m, Arc::clone(b)))).flatten()
 }
@@ -443,6 +462,24 @@ mod tests {
         assert_eq!(snapshot(&st)["item"]["art"], Value::Null, "art of an older revision is not offered");
         assert!(art_for(&st, 6).is_none());
         assert_eq!(page(&st)["clientIdTail"], "3f2a");
+    }
+
+    #[test]
+    fn queue_is_shared_only_under_the_track_it_belongs_to() {
+        {
+            let mut st = lock();
+            *st = connected();
+            st.player.as_mut().unwrap().item.as_mut().unwrap().title = "Best Song Ever".into();
+            st.queue = vec![Upcoming { title: "Sienna".into(), artists: "The Marias".into(), art_url: None }];
+            st.queue_rev = 3;
+        }
+        let q = queue_for(" best song ever ").expect("queue for the playing track");
+        assert_eq!(q["rev"], 3);
+        assert_eq!(q["items"][0]["title"], "Sienna");
+        assert!(queue_for("Another Song").is_none());
+        lock().status = Status::NeedsLogin;
+        assert!(queue_for("Best Song Ever").is_none());
+        *lock() = State::default();
     }
 
     #[test]
