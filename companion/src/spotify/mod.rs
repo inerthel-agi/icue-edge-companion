@@ -179,6 +179,7 @@ pub fn init() {
         }
         None => st.status = Status::NotConfigured,
     }
+    st.rate_limited_until = api::saved_ban();
     publish(&mut st);
 }
 

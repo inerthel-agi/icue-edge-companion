@@ -1,10 +1,10 @@
 //! Spotify Web API polling, artwork, LRCLIB lyrics and command execution.
-//! Polls /me/player every 1 s while playing, 3 s when paused, 8 s with nothing playing,
+//! Polls /me/player every 3 s while playing, 5 s when paused, 10 s with nothing playing,
 //! and waits on Retry-After when Spotify rate-limits.
 use super::{auth, lock, parse_lrc, publish, publish_if, Allowed, Art, Call, Device, Item, Line, Lyrics, Player, Status, Upcoming, HUB, QUEUE_LEN};
 use crate::util::{now_ms, read_limited, SEC};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -19,6 +19,24 @@ const MAX_API_BYTES: usize = 2 * 1024 * 1024;
 /// Reported and predicted positions may drift this much before a snapshot is re-sent.
 const DRIFT_MS: u64 = 1500;
 
+/// Own budget: at most BUDGET Web API calls per WINDOW (Spotify counts over a rolling 30 s too).
+/// Normal use is about 12: one reading every 3 s plus the queue, profile and commands.
+const BUDGET: usize = 20;
+const WINDOW_MS: u64 = 30 * SEC;
+/// After a ban ends the poller stays gentle (>= 5 s between readings) for this long.
+const COOLDOWN_MS: u64 = 5 * 60 * SEC;
+static CALLS: Mutex<VecDeque<u64>> = Mutex::new(VecDeque::new());
+static COOL_UNTIL: AtomicU64 = AtomicU64::new(0);
+
+fn ban_path() -> std::path::PathBuf {
+    crate::util::app_dir().join("spotify-ban.txt")
+}
+
+/// End of a Spotify ban saved by an earlier run, if it has not passed yet.
+pub fn saved_ban() -> Option<u64> {
+    std::fs::read_to_string(ban_path()).ok()?.trim().parse::<u64>().ok().filter(|&t| t > now_ms())
+}
+
 enum ApiError {
     Unauthorized,
     Premium,
@@ -32,6 +50,21 @@ fn direct_get(url: &str) -> Result<ureq::Response, ureq::Error> {
 }
 
 fn request(method: &str, path: &str, body: Option<&str>) -> Result<Option<Value>, ApiError> {
+    // While Spotify says wait, no thread (queue, profile, devices, commands) may call it: extra calls can extend the ban.
+    if let Some(t) = lock().rate_limited_until.filter(|&t| t > now_ms()) {
+        return Err(ApiError::RateLimited(t - now_ms()));
+    }
+    {
+        let now = now_ms();
+        let mut calls = CALLS.lock().unwrap_or_else(|e| e.into_inner());
+        while calls.front().is_some_and(|&t| t + WINDOW_MS < now) {
+            calls.pop_front();
+        }
+        if calls.len() >= BUDGET {
+            return Err(ApiError::RateLimited(calls[0] + WINDOW_MS - now + 1));
+        }
+        calls.push_back(now);
+    }
     let token = auth::access_token().map_err(|s| match s {
         Status::NeedsLogin => ApiError::Unauthorized,
         Status::NotConfigured => ApiError::Other("Spotify is not connected".into()),
@@ -60,7 +93,14 @@ fn request(method: &str, path: &str, body: Option<&str>) -> Result<Option<Value>
         }
         Err(ureq::Error::Status(429, r)) => {
             let secs = r.header("retry-after").and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(30);
-            Err(ApiError::RateLimited(secs.clamp(1, 3600) * SEC))
+            // Recorded here so background callers that drop errors (queue, devices) still honour the wait.
+            let ms = secs.clamp(1, 86_400) * SEC;
+            let err = ApiError::RateLimited(ms);
+            COOL_UNTIL.store(now_ms() + ms + COOLDOWN_MS, Ordering::Relaxed);
+            // Kept on disk: a restart must not call Spotify again before the ban ends.
+            let _ = std::fs::write(ban_path(), (now_ms() + ms).to_string());
+            apply_error(&err);
+            Err(err)
         }
         Err(ureq::Error::Status(code, _)) => Err(ApiError::Other(format!("Spotify answered {code}"))),
         Err(_) => Err(ApiError::Other("Spotify is unreachable".into())),
@@ -277,7 +317,7 @@ fn upcoming_from(v: &Value) -> Vec<Upcoming> {
 
 static QUEUE_GEN: AtomicU64 = AtomicU64::new(0);
 static QUEUE_AT: AtomicU64 = AtomicU64::new(0);
-const QUEUE_EVERY_MS: u64 = 30 * SEC;
+const QUEUE_EVERY_MS: u64 = 60 * SEC;
 const MAX_THUMB_BYTES: u64 = 1024 * 1024;
 
 fn fetch_queue() {
@@ -353,7 +393,7 @@ fn poll_once(last_devices: &mut u64) -> Duration {
     let reading = call_api("GET", "/me/player?additional_types=episode", None);
     match reading {
         Err(e) => {
-            let wait = if let ApiError::RateLimited(ms) = e { Duration::from_millis(ms) } else { Duration::from_secs(10) };
+            let wait = if let ApiError::RateLimited(ms) = e { Duration::from_millis(ms) } else { Duration::from_secs(15) };
             apply_error(&e);
             wait
         }
@@ -391,9 +431,9 @@ fn poll_once(last_devices: &mut u64) -> Duration {
                 }
                 publish_if(&mut st, changed || spawn.is_some());
                 let wait = match &player {
-                    Some(p) if p.playing => 1,
-                    Some(_) => 3,
-                    None => 8,
+                    Some(p) if p.playing => 3,
+                    Some(_) => 5,
+                    None => 10,
                 };
                 (spawn, Duration::from_secs(wait), reshuffled)
             };
@@ -417,7 +457,7 @@ fn poll_once(last_devices: &mut u64) -> Duration {
                 *last_devices = now;
                 fetch_devices();
             }
-            wait
+            if now_ms() < COOL_UNTIL.load(Ordering::Relaxed) { wait.max(Duration::from_secs(10)) } else { wait }
         }
     }
 }

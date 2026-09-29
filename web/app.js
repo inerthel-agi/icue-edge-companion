@@ -234,7 +234,7 @@
         (dev ? spRow(esc(dev.name) + " · " + esc(dev.type), "Active device" + (dev.volume == null ? " · volume fixed by the device" : " · volume " + dev.volume + "%")) : spRow("No active device", "Start Spotify on a computer, phone or speaker.")) +
         (item ? spRow(esc(item.title), esc(item.artists) + (item.playing ? " · playing" : " · paused")) : "") +
         spRow("Lyrics", "Synced lyrics from LRCLIB (community database) · " + esc(s.lyrics)) +
-        spRow("Refresh", "Every second while playing, every 3 to 8 s otherwise. Spotify rate limits are respected." + (s.rateLimitedUntil ? " Waiting for Spotify, retry in " + U.dur(s.rateLimitedUntil - Date.now()) + "." : "")) + "</div>" +
+        spRow("Refresh", "Every 3 s while playing, 5 to 10 s otherwise, at most 20 requests per 30 s. Spotify rate limits are respected, also across restarts." + (s.rateLimitedUntil ? " Waiting for Spotify, retry in " + U.dur(s.rateLimitedUntil - Date.now()) + "." : "")) + "</div>" +
         '<div class="group-title">XENEON widget</div><div class="group">' + spRow("Spotify widget", "Add “Spotify” in iCUE · XENEON EDGE. Nothing to enter in iCUE.") + "</div>" +
         '<div class="group">' + spRow("Disconnect", "Deletes the token from this computer. The widget shows “Connect Spotify”.", '<button type="button" class="btn danger" data-act="sp-disconnect">Disconnect</button>') + "</div></div>";
     }

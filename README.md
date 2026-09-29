@@ -91,7 +91,7 @@ Without the companion, the `Now Playing` and `Windows Media Pump` widgets fall b
 | Claude quotas and extra usage | `GET https://api.anthropic.com/api/oauth/usage` with the token from `~/.claude/.credentials.json` (undocumented interface) | 60 s while active, 10 min idle, `Retry-After` on 429 |
 | Codex tokens, model, client, context | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, `token_count` events | Incremental, same schedule |
 | Codex quotas | `rate_limits` in the same events; `codex app-server` `account/rateLimits/read` only when no local value is under 5 min old | 60 s active, 15 min idle, exponential backoff |
-| Spotify playback, devices, account, up next | Spotify Web API `/me/player`, `/me/player/devices`, `/me`, `/me/player/queue` (30 s) with your app's token | 1 s while playing, 3 s paused, 8 s idle; `Retry-After` on 429 |
+| Spotify playback, devices, account, up next | Spotify Web API `/me/player`, `/me/player/devices`, `/me`, `/me/player/queue` (60 s) with your app's token | 3 s while playing, 5 s paused, 10 s idle; at most 20 calls per 30 s; `Retry-After` on 429, kept across restarts |
 | Spotify lyrics | `lrclib.net/api/get`, then `lrclib.net/api/search` (duration within 5 s), synced lyrics only | Once per track, 64 tracks cached in memory |
 | Media title, state, position, controls, artwork | Windows `GlobalSystemMediaTransportControlsSessionManager` (sessions shown in the Windows media flyout) | 500 ms; thumbnail read on track change, then every 10 s |
 
